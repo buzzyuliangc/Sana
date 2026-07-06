@@ -1,0 +1,9 @@
+# SANA-WM speed-bench smoke set: pinned scene IDs, one per line.
+# This file is a placeholder — regenerate it once the benchmark dataset is
+# downloaded, so the picks reflect the real (anonymized) scene IDs:
+#
+#   python tools/metrics/sana_wm/speed_bench.py pick-smoke \
+#     --manifest data/SANA-WM-Bench/benchmark_v2_smooth_60s/sanawm_export_v2/run_manifest.jsonl \
+#     --per_category 2 --out tools/metrics/sana_wm/smoke_scenes.txt
+#
+# Once generated, commit the pinned list so every A/B run uses the same scenes.
