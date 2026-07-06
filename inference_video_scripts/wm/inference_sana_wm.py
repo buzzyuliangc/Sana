@@ -1114,6 +1114,7 @@ class SanaWMPipeline:
         offload_vae: bool = False,
         offload_refiner: bool = False,
         offload_text_encoder: bool = False,
+        cache_camera_geometry: bool = False,
         logger: logging.Logger | None = None,
     ):
         self.config = config
@@ -1122,6 +1123,7 @@ class SanaWMPipeline:
         self.offload_vae = offload_vae
         self.offload_refiner = offload_refiner
         self.offload_text_encoder = offload_text_encoder
+        self.cache_camera_geometry = cache_camera_geometry
         self.logger = logger or get_root_logger()
         self._model_path = model_path
         self.weight_dtype = get_weight_dtype(config.model.mixed_precision)
@@ -1634,6 +1636,77 @@ class SanaWMPipeline:
             cache[key] = (embeds.detach(), attention_mask.detach())
         return embeds, attention_mask
 
+    def _precompute_camera_geometry(
+        self,
+        raymap_cfg: torch.Tensor,
+        chunk_plucker_cfg: torch.Tensor,
+        latent_T: int,
+        latent_h: int,
+        latent_w: int,
+    ) -> dict[str, object]:
+        """Precompute per-scene camera geometry reused across all denoising steps.
+
+        ``SanaMSVideoCamCtrl.forward`` rebuilds the UCPE ray matrices, absmap,
+        WanRoPE frequencies, and the Plücker embedding on every call even
+        though they depend only on the camera trajectory, which is fixed for
+        the whole sampling loop (~2x steps calls under CFG). All of them have
+        precomputed-input escape hatches (``cam_pos_embeds`` / ``pos_embeds``
+        / ``plucker_emb``); this method produces exactly the tensors the
+        online path would compute — same inputs, ops, and dtypes — so cached
+        and uncached stage-1 latents are expected to be bit-identical.
+        """
+        from diffusion.model.nets.sana_camctrl_blocks import (
+            _invert_SE3,
+            _process_camera_conditions_ucpe,
+            _slice_rope_for_cam,
+        )
+
+        model = self.model
+        if getattr(model, "pack_latents", False):
+            raise ValueError("cache_camera_geometry does not support pack_latents models.")
+        B = raymap_cfg.shape[0]
+        fhw = (
+            latent_T // model.patch_size[0],
+            latent_h // model.patch_size[1],
+            latent_w // model.patch_size[2],
+        )
+
+        # Ray matrices + absmap, as in forward() (sana_multi_scale_video_camctrl.py).
+        raymats, absmap = _process_camera_conditions_ucpe(raymap_cfg, B, fhw, model.patch_size)
+        absmap = absmap.permute(0, 4, 1, 2, 3).to(self.weight_dtype)  # (B, 3, F, H, W)
+        # prepare_prope_fns' fully-cached path needs P, P_inv, and the cam RoPE
+        # slice; with only P it would still invert per forward.
+        P = raymats.reshape(B, -1, 4, 4)
+        P_inv = _invert_SE3(P)
+
+        if model.attn_type in ["flash", "FlexLinearAttention", "flex"]:
+            head_dim = model.hidden_size // model.num_heads
+        else:
+            head_dim = model.linear_head_dim
+
+        cached: dict[str, object] = {}
+        pos_embeds = None
+        if getattr(model, "use_pe", False) and model.pos_embed_type in (
+            "wan_rope",
+            "casual_wan_rope",
+            "wan_temporal_rope",
+        ):
+            pos_embeds = model.rope(fhw, raymap_cfg.device)
+            cached["pos_embeds"] = pos_embeds
+
+        cam_pos_embeds: dict[str, torch.Tensor] = {"absmap": absmap, "P": P, "P_inv": P_inv}
+        if pos_embeds is not None:
+            cam_pos_embeds["pos_embeds_cam"] = _slice_rope_for_cam(pos_embeds, head_dim, head_dim // 2)
+        cached["cam_pos_embeds"] = cam_pos_embeds
+
+        # The post-attention Plücker embedding is read directly from kwargs by
+        # the blocks; the input-additive variant has no escape hatch, so only
+        # cache when post-attn is the sole consumer.
+        if getattr(model, "use_chunk_plucker_post_attn", False) and not getattr(model, "use_chunk_plucker_input", False):
+            cached["plucker_emb"] = model.plucker_embedder(chunk_plucker_cfg.to(model.dtype))
+
+        return cached
+
     def _sample_stage1(
         self,
         image: Image.Image,
@@ -1699,6 +1772,23 @@ class SanaWMPipeline:
         if chunk_index is not None:
             model_kwargs["chunk_index"] = chunk_index
 
+        if self.cache_camera_geometry:
+            # ChunkFlowEuler/self-forcing slice model_kwargs temporally and do
+            # not understand the cached keys; restrict to full-sequence solvers.
+            if params.sampling_algo not in ("flow_euler_ltx", "flow_euler"):
+                self.logger.warning(
+                    "cache_camera_geometry only supports flow_euler_ltx/flow_euler; "
+                    f"ignoring for sampling_algo={params.sampling_algo!r}."
+                )
+            else:
+                with self._stage("camera_geometry_precompute"):
+                    cached_geometry = self._precompute_camera_geometry(
+                        raymap_cfg, chunk_plucker_cfg, latent_T, latent_h, latent_w
+                    )
+                if "plucker_emb" in cached_geometry:
+                    model_kwargs.pop("chunk_plucker", None)
+                model_kwargs.update(cached_geometry)
+
         flow_shift = self._resolve_flow_shift(params.flow_shift)
         self._prepare_stage1_nvfp4()
         if torch.cuda.is_available():
@@ -1725,6 +1815,10 @@ class SanaWMPipeline:
         self.logger.info(
             f"[timing] stage1 sample: {time.perf_counter() - t0:.3f}s " f"(latent shape {tuple(samples.shape)})"
         )
+        # Release cached camera geometry (RoPE table + Plücker embedding are
+        # large) before the refiner stage.
+        for key in ("cam_pos_embeds", "pos_embeds", "plucker_emb"):
+            model_kwargs.pop(key, None)
         torch.cuda.empty_cache()
         return samples.detach()
 
@@ -2301,6 +2395,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--negative_prompt", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--cache_camera_geometry",
+        action="store_true",
+        help="Precompute UCPE ray matrices, WanRoPE, and the Plücker embedding "
+        "once per scene instead of on every denoising step. Numerically "
+        "identical to the default path (flow_euler_ltx/flow_euler only).",
+    )
+    p.add_argument(
         "--timing_json",
         type=Path,
         default=None,
@@ -2461,6 +2562,7 @@ def main() -> None:
         refiner=refiner,
         offload_vae=args.offload_vae,
         offload_refiner=args.offload_refiner,
+        cache_camera_geometry=args.cache_camera_geometry,
         logger=logger,
     )
 
