@@ -40,8 +40,10 @@ import json
 import logging
 import math
 import os
+import subprocess
 import time
 import types
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -533,6 +535,155 @@ ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
 _ACTION_MAPPING_NOTICE_SHOWN = False
 
 # ============================================================================
+# Timing instrumentation (bidirectional path)
+# ============================================================================
+
+
+@dataclass
+class _StageRecord:
+    wall_s: float
+    cuda_s: float | None
+    peak_mem_gb: float | None
+
+
+class StageTimings:
+    """Per-stage wall/CUDA timing + peak VRAM for one ``generate()`` call.
+
+    Mirrors the streaming pipeline's CUDA-event instrumentation
+    (``streaming_pipeline.py``) for the bidirectional path. Stages are recorded
+    as an ordered list so repeated stages (e.g. two VAE decodes with
+    ``save_stage1``) stay distinguishable; ``to_dict`` aggregates by name.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.cuda = enabled and torch.cuda.is_available()
+        self.records: list[tuple[str, _StageRecord]] = []
+        self.per_step_ms: list[float] = []
+        self.model_eval_count = 0
+        self.post_load_mem_gb: float | None = None
+        self.e2e_wall_s: float | None = None
+        self._step_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+    @contextmanager
+    def stage(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        if self.cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+        wall_start = time.perf_counter()
+        try:
+            yield
+        finally:
+            wall_s = time.perf_counter() - wall_start
+            cuda_s = peak_gb = None
+            if self.cuda:
+                ev_end.record()
+                torch.cuda.synchronize()
+                cuda_s = ev_start.elapsed_time(ev_end) / 1000.0
+                peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+            self.records.append((name, _StageRecord(wall_s, cuda_s, peak_gb)))
+
+    def capture_post_load_mem(self) -> None:
+        if self.enabled and self.cuda:
+            self.post_load_mem_gb = torch.cuda.max_memory_allocated() / 1024**3
+
+    def record_model_call(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        """Register one model evaluation; returns the event pair to record around it."""
+        self.model_eval_count += 1
+        if not self.cuda:
+            return None
+        pair = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        self._step_events.append(pair)
+        return pair
+
+    def finalize_steps(self) -> None:
+        """Resolve model-call events into ms latencies. Call after a CUDA sync."""
+        for start, end in self._step_events:
+            self.per_step_ms.append(start.elapsed_time(end))
+        self._step_events.clear()
+
+    def to_dict(self) -> dict[str, object]:
+        stages: dict[str, dict[str, object]] = {}
+        for name, rec in self.records:
+            agg = stages.setdefault(name, {"wall_s": 0.0, "cuda_s": 0.0, "peak_mem_gb": 0.0, "count": 0})
+            agg["wall_s"] += rec.wall_s
+            agg["cuda_s"] += rec.cuda_s or 0.0
+            agg["peak_mem_gb"] = max(agg["peak_mem_gb"], rec.peak_mem_gb or 0.0)
+            agg["count"] += 1
+        payload: dict[str, object] = {
+            "stages": stages,
+            "per_step_ms": self.per_step_ms,
+            "model_eval_count": self.model_eval_count,
+            "peak_mem_gb": max((s["peak_mem_gb"] for s in stages.values()), default=0.0),
+            "post_load_mem_gb": self.post_load_mem_gb,
+        }
+        if self.e2e_wall_s is not None:
+            payload["end_to_end_s"] = self.e2e_wall_s
+        if self.per_step_ms:
+            steps = sorted(self.per_step_ms)
+            payload["step_ms_mean"] = sum(steps) / len(steps)
+            payload["step_ms_p50"] = steps[len(steps) // 2]
+            payload["step_ms_p90"] = steps[min(len(steps) - 1, int(len(steps) * 0.9))]
+        return payload
+
+
+class _CudaEventTimedModel:
+    """Transparent model wrapper that CUDA-event-times every ``__call__``.
+
+    Attribute access delegates to the wrapped module so solvers that poke at
+    model attributes keep working; only direct calls are timed/counted.
+    """
+
+    def __init__(self, model: nn.Module, timings: StageTimings):
+        object.__setattr__(self, "_wrapped_model", model)
+        object.__setattr__(self, "_timings", timings)
+
+    def __call__(self, *args, **kwargs):
+        pair = self._timings.record_model_call()
+        if pair is None:
+            return self._wrapped_model(*args, **kwargs)
+        start, end = pair
+        start.record()
+        out = self._wrapped_model(*args, **kwargs)
+        end.record()
+        return out
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_wrapped_model"), name)
+
+
+def _collect_environment_info(args: argparse.Namespace) -> dict[str, object]:
+    info: dict[str, object] = {
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+    }
+    if torch.cuda.is_available():
+        info["gpu"] = torch.cuda.get_device_name(0)
+        info["gpu_capability"] = ".".join(map(str, torch.cuda.get_device_capability(0)))
+    try:
+        info["git_sha"] = (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            or None
+        )
+    except (OSError, subprocess.SubprocessError):
+        info["git_sha"] = None
+    return info
+
+
+# ============================================================================
 # Config
 # ============================================================================
 
@@ -976,6 +1127,8 @@ class SanaWMPipeline:
         self.weight_dtype = get_weight_dtype(config.model.mixed_precision)
         self.vae_dtype = get_weight_dtype(config.vae.weight_dtype)
         self._refiner_built = False
+        # Optional per-generate() instrumentation; set by callers (e.g. --timing_json).
+        self.timings: StageTimings | None = None
         self._streaming_stage1_prompt_cache: dict[
             tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
@@ -1260,6 +1413,12 @@ class SanaWMPipeline:
 
     # ------- generation -------
 
+    def _stage(self, name: str):
+        """Timing stage context; no-op when instrumentation is disabled."""
+        if self.timings is None:
+            return nullcontext()
+        return self.timings.stage(name)
+
     @torch.inference_mode()
     def generate(
         self,
@@ -1285,12 +1444,15 @@ class SanaWMPipeline:
         latent_T = (params.num_frames - 1) // vae_stride[0] + 1
         latent_h, latent_w = TARGET_HEIGHT // vae_stride[-1], TARGET_WIDTH // vae_stride[-1]
 
-        camera = prepare_camera(
-            c2w[: params.num_frames],
-            intrinsics_vec4[: params.num_frames],
-            target_size=(TARGET_HEIGHT, TARGET_WIDTH),
-            vae_stride=vae_stride,
-        )
+        if self.timings is not None:
+            self.timings.capture_post_load_mem()
+        with self._stage("camera_prep_cpu"):
+            camera = prepare_camera(
+                c2w[: params.num_frames],
+                intrinsics_vec4[: params.num_frames],
+                target_size=(TARGET_HEIGHT, TARGET_WIDTH),
+                vae_stride=vae_stride,
+            )
 
         sana_latent = self._sample_stage1(image, prompt, camera, params, latent_T, latent_h, latent_w)
 
@@ -1484,20 +1646,22 @@ class SanaWMPipeline:
     ) -> torch.Tensor:
         if self.offload_vae:
             self.vae.to(self.device)
-        img = (T.ToTensor()(image) * 2.0 - 1.0).unsqueeze(0).unsqueeze(2)
-        first_latent = vae_encode(
-            self.config.vae.vae_type,
-            self.vae,
-            img.to(self.device, dtype=self.vae_dtype),
-            device=self.device,
-        ).to(self.weight_dtype)
+        with self._stage("first_frame_vae_encode"):
+            img = (T.ToTensor()(image) * 2.0 - 1.0).unsqueeze(0).unsqueeze(2)
+            first_latent = vae_encode(
+                self.config.vae.vae_type,
+                self.vae,
+                img.to(self.device, dtype=self.vae_dtype),
+                device=self.device,
+            ).to(self.weight_dtype)
         if self.offload_vae:
             self.vae.to("cpu")
             torch.cuda.empty_cache()
         else:
             self._offload_vae_encoder_for_streaming()
 
-        cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
+        with self._stage("text_encode"):
+            cond, cond_mask, neg, neg_mask = self._encode_prompts(prompt, params.negative_prompt)
         cond, cond_mask, neg, neg_mask = self._pad_stage1_text_for_nvfp4(cond, cond_mask, neg, neg_mask)
         raymap = camera["raymap"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
         chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(self.device, dtype=self.weight_dtype)
@@ -1540,21 +1704,24 @@ class SanaWMPipeline:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        samples = self._dispatch_solver(
-            params.sampling_algo,
-            z,
-            cond,
-            neg,
-            params.cfg_scale,
-            flow_shift,
-            params.step,
-            model_kwargs,
-            chunk_index,
-            generator,
-            params,
-        )
+        with self._stage("stage1_sampling"):
+            samples = self._dispatch_solver(
+                params.sampling_algo,
+                z,
+                cond,
+                neg,
+                params.cfg_scale,
+                flow_shift,
+                params.step,
+                model_kwargs,
+                chunk_index,
+                generator,
+                params,
+            )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if self.timings is not None:
+            self.timings.finalize_steps()
         self.logger.info(
             f"[timing] stage1 sample: {time.perf_counter() - t0:.3f}s " f"(latent shape {tuple(samples.shape)})"
         )
@@ -1584,16 +1751,18 @@ class SanaWMPipeline:
         generator: torch.Generator,
         params: GenerationParams,
     ) -> torch.Tensor:
+        # Wrap the model so every solver call is CUDA-event timed and counted.
+        model_fn = self.model if self.timings is None else _CudaEventTimedModel(self.model, self.timings)
         base = dict(
             condition=cond, uncondition=neg, cfg_scale=cfg_scale, flow_shift=flow_shift, model_kwargs=model_kwargs
         )
         if algo == "flow_euler_ltx":
-            return LTXFlowEuler(self.model, **base).sample(z, steps=steps, generator=generator)
+            return LTXFlowEuler(model_fn, **base).sample(z, steps=steps, generator=generator)
         if algo == "flow_euler":
-            return FlowEuler(self.model, **base).sample(z, steps=steps)
+            return FlowEuler(model_fn, **base).sample(z, steps=steps)
         if algo == "flow_dpm-solver":
             return DPMS(
-                self.model,
+                model_fn,
                 condition=cond,
                 uncondition=neg,
                 cfg_scale=cfg_scale,
@@ -1664,7 +1833,8 @@ class SanaWMPipeline:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        decoded = vae_decode(self.config.vae.vae_type, self.vae, samples)
+        with self._stage("vae_decode"):
+            decoded = vae_decode(self.config.vae.vae_type, self.vae, samples)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.logger.info(
@@ -1697,16 +1867,19 @@ class SanaWMPipeline:
         start_sigma = float(sigmas[0])
         self.logger.info(f"[refiner] {len(sigmas) - 1}-step Euler, start_sigma={start_sigma:.4f}")
 
-        refined = self.refiner.refine_latents(
-            sana_latent,
-            prompt,
-            fps=float(params.fps),
-            sink_size=int(refiner.sink_size),
-            seed=int(refiner.seed),
-            progress=True,
-            block_size=refiner.block_size,
-            kv_max_frames=int(refiner.kv_max_frames),
-        )
+        # Timing note: refine_latents internally re-encodes the prompt with the
+        # refiner's Gemma text encoder, so the "refiner" stage includes it.
+        with self._stage("refiner"):
+            refined = self.refiner.refine_latents(
+                sana_latent,
+                prompt,
+                fps=float(params.fps),
+                sink_size=int(refiner.sink_size),
+                seed=int(refiner.seed),
+                progress=True,
+                block_size=refiner.block_size,
+                kv_max_frames=int(refiner.kv_max_frames),
+            )
         if self.offload_refiner:
             self._release_refiner()
 
@@ -2128,6 +2301,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--negative_prompt", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--timing_json",
+        type=Path,
+        default=None,
+        help="Write per-stage wall/CUDA timing, per-step DiT latencies, peak "
+        "VRAM, and environment info to this JSON file.",
+    )
+    p.add_argument(
+        "--save_stage1_latents",
+        type=Path,
+        default=None,
+        help="torch.save the pre-refiner Stage-1 latent tensor to this path "
+        "(for A/B equivalence checks).",
+    )
+    p.add_argument(
         "--no_action_overlay",
         action="store_true",
         help="Skip rendering the WASD + joystick overlay on the output video.",
@@ -2308,7 +2495,28 @@ def main() -> None:
         save_stage1=args.save_stage1,
     )
 
+    timings: StageTimings | None = None
+    if args.timing_json is not None:
+        timings = StageTimings(enabled=True)
+        pipeline.timings = timings
+
+    e2e_start = time.perf_counter()
     out = pipeline.generate(cropped, prompt, c2w, intrinsics_vec4, params)
+    if timings is not None:
+        timings.e2e_wall_s = time.perf_counter() - e2e_start
+
+    if args.save_stage1_latents is not None:
+        args.save_stage1_latents.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(out["latent"], args.save_stage1_latents)
+        logger.info(f"Saved stage-1 latents to {args.save_stage1_latents}")
+
+    if timings is not None:
+        payload = timings.to_dict()
+        payload["environment"] = _collect_environment_info(args)
+        args.timing_json.parent.mkdir(parents=True, exist_ok=True)
+        args.timing_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info(f"Wrote timing JSON to {args.timing_json}")
+
     video_hwc = out["video"]
 
     if not args.no_action_overlay:
