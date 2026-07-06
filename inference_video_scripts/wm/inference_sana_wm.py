@@ -709,6 +709,10 @@ class GenerationParams:
     fps: int = 16
     step: int = 60
     cfg_scale: float = 5.0
+    # Fraction of steps that run classifier-free guidance (batch 2); the
+    # remaining low-noise steps run condition-only. 1.0 = full CFG.
+    # Only honored by sampling_algo == "flow_euler_ltx".
+    cfg_truncate_ratio: float = 1.0
     flow_shift: float | None = None
     seed: int = 42
     negative_prompt: str = ""
@@ -1851,7 +1855,14 @@ class SanaWMPipeline:
             condition=cond, uncondition=neg, cfg_scale=cfg_scale, flow_shift=flow_shift, model_kwargs=model_kwargs
         )
         if algo == "flow_euler_ltx":
-            return LTXFlowEuler(model_fn, **base).sample(z, steps=steps, generator=generator)
+            return LTXFlowEuler(model_fn, **base, cfg_truncate_ratio=params.cfg_truncate_ratio).sample(
+                z, steps=steps, generator=generator
+            )
+        if params.cfg_truncate_ratio < 1.0:
+            self.logger.warning(
+                f"cfg_truncate_ratio={params.cfg_truncate_ratio} is only honored by "
+                f"sampling_algo=flow_euler_ltx; ignoring for {algo!r}."
+            )
         if algo == "flow_euler":
             return FlowEuler(model_fn, **base).sample(z, steps=steps)
         if algo == "flow_dpm-solver":
@@ -2346,6 +2357,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fps", type=int, default=16)
     p.add_argument("--step", type=int, default=60, help="DiT sampling steps.")
     p.add_argument("--cfg_scale", type=float, default=5.0)
+    p.add_argument(
+        "--cfg_truncate_ratio",
+        type=float,
+        default=1.0,
+        help="Run classifier-free guidance only for the first R fraction of "
+        "steps; remaining steps are condition-only (single forward). "
+        "flow_euler_ltx only.",
+    )
     p.add_argument("--flow_shift", type=float, default=None, help="Override the scheduler's inference flow_shift.")
     p.add_argument(
         "--sampling_algo",
@@ -2585,6 +2604,7 @@ def main() -> None:
         fps=args.fps,
         step=args.step,
         cfg_scale=args.cfg_scale,
+        cfg_truncate_ratio=args.cfg_truncate_ratio,
         flow_shift=args.flow_shift,
         seed=args.seed,
         negative_prompt=args.negative_prompt,

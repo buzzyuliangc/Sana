@@ -14,6 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import os
 
 import torch
@@ -84,8 +85,37 @@ class FlowEuler:
 
 
 class LTXFlowEuler(FlowEuler):
-    def __init__(self, model_fn, condition, uncondition, cfg_scale, flow_shift=3.0, model_kwargs=None):
+    def __init__(
+        self, model_fn, condition, uncondition, cfg_scale, flow_shift=3.0, model_kwargs=None, cfg_truncate_ratio=1.0
+    ):
         super().__init__(model_fn, condition, uncondition, cfg_scale, flow_shift, model_kwargs)
+        if not 0.0 <= cfg_truncate_ratio <= 1.0:
+            raise ValueError(f"cfg_truncate_ratio must be in [0, 1], got {cfg_truncate_ratio}")
+        # Apply classifier-free guidance only for the first
+        # ceil(cfg_truncate_ratio * steps) steps; the remaining (low-noise)
+        # steps run condition-only, halving their model-eval cost.
+        self.cfg_truncate_ratio = cfg_truncate_ratio
+
+    def _cond_only_kwargs(self) -> dict:
+        """Batch-1 (condition-only) view of the CFG-duplicated model kwargs.
+
+        The pipeline duplicates per-scene kwargs to batch 2 as
+        ``cat([uncond, cond])``; the condition half is the second chunk.
+        Non-tensors and batch-1 broadcasts are shared by reference.
+        """
+
+        def cond_half(value):
+            if isinstance(value, torch.Tensor) and value.shape[0] == 2:
+                return value.chunk(2, dim=0)[1]
+            return value
+
+        sliced = {}
+        for key, value in (self.model_kwargs or {}).items():
+            if isinstance(value, dict) and key != "data_info":
+                sliced[key] = {k: cond_half(v) for k, v in value.items()}
+            else:
+                sliced[key] = cond_half(value)
+        return sliced
 
     @staticmethod
     def add_noise_to_image_conditioning_latents(
@@ -138,6 +168,13 @@ class LTXFlowEuler(FlowEuler):
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([self.uncondition, self.condition], dim=0)
 
+        # CFG truncation: guided steps first, condition-only afterwards.
+        num_cfg_steps = len(timesteps)
+        model_kwargs_cond = None
+        if do_classifier_free_guidance and self.cfg_truncate_ratio < 1.0:
+            num_cfg_steps = math.ceil(self.cfg_truncate_ratio * len(timesteps))
+            model_kwargs_cond = self._cond_only_kwargs()
+
         init_latents = latents.clone()  # here we need to clone to avoid modifying the original latents
 
         for i, t in tqdm(list(enumerate(timesteps)), disable=os.getenv("DPM_TQDM", "False") == "True"):
@@ -146,9 +183,10 @@ class LTXFlowEuler(FlowEuler):
                     t / 1000.0, init_latents, latents, image_cond_noise_scale, condition_mask, generator
                 )
 
-            condition_mask_input = torch.cat([condition_mask] * 2) if do_classifier_free_guidance else condition_mask
+            use_cfg = do_classifier_free_guidance and i < num_cfg_steps
+            condition_mask_input = torch.cat([condition_mask] * 2) if use_cfg else condition_mask
             # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = torch.cat([latents] * 2) if use_cfg else latents
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(condition_mask_input.shape).float()
             timestep = torch.min(timestep, (1 - condition_mask_input) * 1000.0)
@@ -157,15 +195,15 @@ class LTXFlowEuler(FlowEuler):
                 latent_model_input,
                 # timestep[:, 0, 0, 0, 0], # b
                 timestep[:, :1, :, 0, 0],  # b,c,f,h,w -> b,1,f
-                prompt_embeds,
-                **self.model_kwargs,
+                prompt_embeds if use_cfg else self.condition,
+                **(self.model_kwargs if use_cfg else (model_kwargs_cond or self.model_kwargs)),
             )  # b,c,f,h,w
 
             if isinstance(noise_pred, Transformer2DModelOutput):
                 noise_pred = noise_pred[0]
 
             # perform guidance
-            if do_classifier_free_guidance:
+            if use_cfg:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_text - noise_pred_uncond)
                 timestep = timestep.chunk(2)[0]
