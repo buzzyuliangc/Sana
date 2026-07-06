@@ -630,6 +630,11 @@ class StageTimings:
             payload["step_ms_mean"] = sum(steps) / len(steps)
             payload["step_ms_p50"] = steps[len(steps) // 2]
             payload["step_ms_p90"] = steps[min(len(steps) - 1, int(len(steps) * 0.9))]
+            # First call carries warmup (torch.compile/autotune, allocator
+            # growth); the excl-first mean is the steady-state number.
+            if len(self.per_step_ms) > 1:
+                tail = self.per_step_ms[1:]
+                payload["step_ms_mean_excl_first"] = sum(tail) / len(tail)
         return payload
 
 
@@ -1795,9 +1800,13 @@ class SanaWMPipeline:
                 if "plucker_emb" in cached_geometry:
                     model_kwargs.pop("chunk_plucker", None)
                 model_kwargs.update(cached_geometry)
+                # model_kwargs must be the ONLY reference so the post-sampling
+                # pops below actually free the tensors before the refiner.
+                del cached_geometry
 
         flow_shift = self._resolve_flow_shift(params.flow_shift)
-        self._prepare_stage1_nvfp4()
+        with self._stage("stage1_prepare"):
+            self._prepare_stage1_nvfp4()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1891,7 +1900,7 @@ class SanaWMPipeline:
                 else 1.0 / len(ChunkFlowEuler.create_temporal_chunks(z.shape[2], chunk_index))
             )
             self.logger.info("ChunkFlowEuler: chunk_index=%s interval_k=%.6f", chunk_index, interval_k)
-            return ChunkFlowEuler(self.model, **base).sample(
+            return ChunkFlowEuler(model_fn, **base).sample(
                 z,
                 steps=steps,
                 generator=generator,
@@ -1910,7 +1919,7 @@ class SanaWMPipeline:
             # the old concat-layout and the new state-or-concat dual-mode flag in
             # slot 6 — required for the hybrid GDN+Softmax chunk-causal Sana-WM.
             solver = SelfForcingFlowEulerCamCtrl(
-                self.model,
+                model_fn,
                 condition=cond,
                 uncondition=neg,
                 cfg_scale=cfg_scale,
@@ -1968,8 +1977,11 @@ class SanaWMPipeline:
         refiner: RefinerSettings,
     ) -> np.ndarray:
         if self.offload_refiner:
-            self._offload_stage1()
-            self._build_refiner()
+            # Timed as its own stage: the transient load peak while stage-1 and
+            # refiner weights briefly coexist is often the true VRAM peak.
+            with self._stage("refiner_build"):
+                self._offload_stage1()
+                self._build_refiner()
 
         sigma_values = tuple(refiner.sigmas) if refiner.sigmas else STAGE_2_DISTILLED_SIGMA_VALUES
         self.logger.info(f"[refiner] {len(sigma_values) - 1}-step Euler, start_sigma={sigma_values[0]:.4f}")
@@ -2585,8 +2597,9 @@ def main() -> None:
     refiner_sigmas: tuple[float, ...] | None = None
     if args.refiner_sigmas:
         refiner_sigmas = tuple(float(s.strip()) for s in args.refiner_sigmas.split(",") if s.strip())
-        if len(refiner_sigmas) < 2 or refiner_sigmas[-1] != 0.0 or list(refiner_sigmas) != sorted(refiner_sigmas, reverse=True):
-            raise SystemExit("--refiner_sigmas must be a descending comma-separated list ending in 0.0.")
+        strictly_descending = all(a > b for a, b in zip(refiner_sigmas, refiner_sigmas[1:]))
+        if len(refiner_sigmas) < 2 or refiner_sigmas[-1] != 0.0 or not strictly_descending:
+            raise SystemExit("--refiner_sigmas must be a strictly descending comma-separated list ending in 0.0.")
 
     refiner = (
         None
@@ -2616,6 +2629,17 @@ def main() -> None:
     if args.compile:
         compile_mode = os.environ.get("SANA_WM_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         compile_dynamic = os.environ.get("SANA_WM_TORCH_COMPILE_DYNAMIC", "0") == "1"
+        # NVFP4 conversion matches module paths with anchored regexes; the
+        # OptimizedModule wrapper injects an "_orig_mod" segment, so name
+        # normalization must be on or zero Linears convert (hard error).
+        if os.environ.get("SANA_WM_STAGE1_NVFP4") or os.environ.get("SANA_WM_REFINER_NVFP4"):
+            os.environ.setdefault("SANA_WM_TE_NVFP4_NORMALIZE_MODULE_NAMES", "1")
+            logger.info("NVFP4 + --compile: enabling SANA_WM_TE_NVFP4_NORMALIZE_MODULE_NAMES.")
+        if args.timing_json is not None and "no-cudagraphs" not in compile_mode and "autotune" in compile_mode:
+            logger.warning(
+                f"compile mode {compile_mode!r} may use CUDA graphs; per-step CUDA-event "
+                "timings inside replayed graphs are unreliable."
+            )
         logger.info(f"torch.compile per DiT block: mode={compile_mode} dynamic={compile_dynamic}")
         # Per-block keeps the model-level python (geometry prep, RoPE branches,
         # y-mask handling) out of Dynamo; Triton GDN launches graph-break

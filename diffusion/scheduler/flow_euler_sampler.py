@@ -96,12 +96,18 @@ class LTXFlowEuler(FlowEuler):
         # steps run condition-only, halving their model-eval cost.
         self.cfg_truncate_ratio = cfg_truncate_ratio
 
+    # Kwargs the pipeline CFG-duplicates to batch 2 as ``cat([uncond, cond])``.
+    # Keyed explicitly so an unrelated future kwarg whose leading dim happens
+    # to be 2 is never half-sliced by accident.
+    _CFG_BATCHED_KWARGS = frozenset(
+        {"mask", "camera_conditions", "chunk_plucker", "plucker_emb", "delta_actions", "cam_pos_embeds"}
+    )
+
     def _cond_only_kwargs(self) -> dict:
         """Batch-1 (condition-only) view of the CFG-duplicated model kwargs.
 
-        The pipeline duplicates per-scene kwargs to batch 2 as
-        ``cat([uncond, cond])``; the condition half is the second chunk.
-        Non-tensors and batch-1 broadcasts are shared by reference.
+        The condition half is the second chunk. Non-tensors, batch-1
+        broadcasts, and non-CFG-batched keys are shared by reference.
         """
 
         def cond_half(value):
@@ -111,7 +117,9 @@ class LTXFlowEuler(FlowEuler):
 
         sliced = {}
         for key, value in (self.model_kwargs or {}).items():
-            if isinstance(value, dict) and key != "data_info":
+            if key not in self._CFG_BATCHED_KWARGS:
+                sliced[key] = value
+            elif isinstance(value, dict):
                 sliced[key] = {k: cond_half(v) for k, v in value.items()}
             else:
                 sliced[key] = cond_half(value)
