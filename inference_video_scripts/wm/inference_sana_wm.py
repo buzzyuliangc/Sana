@@ -747,6 +747,9 @@ class RefinerSettings:
     seed: int = 42
     block_size: int | None = None
     kv_max_frames: int = 11
+    # Euler sigma schedule override; None = the canonical 3-step distilled
+    # schedule (STAGE_2_DISTILLED_SIGMA_VALUES). Must be descending, end at 0.
+    sigmas: tuple[float, ...] | None = None
 
 
 # ============================================================================
@@ -1968,9 +1971,8 @@ class SanaWMPipeline:
             self._offload_stage1()
             self._build_refiner()
 
-        sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
-        start_sigma = float(sigmas[0])
-        self.logger.info(f"[refiner] {len(sigmas) - 1}-step Euler, start_sigma={start_sigma:.4f}")
+        sigma_values = tuple(refiner.sigmas) if refiner.sigmas else STAGE_2_DISTILLED_SIGMA_VALUES
+        self.logger.info(f"[refiner] {len(sigma_values) - 1}-step Euler, start_sigma={sigma_values[0]:.4f}")
 
         # Timing note: refine_latents internally re-encodes the prompt with the
         # refiner's Gemma text encoder, so the "refiner" stage includes it.
@@ -1984,6 +1986,7 @@ class SanaWMPipeline:
                 progress=True,
                 block_size=refiner.block_size,
                 kv_max_frames=int(refiner.kv_max_frames),
+                sigmas=sigma_values,
             )
         if self.offload_refiner:
             self._release_refiner()
@@ -2414,6 +2417,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--negative_prompt", default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile each Stage-1 DiT block (mode via "
+        "SANA_WM_TORCH_COMPILE_MODE, default max-autotune-no-cudagraphs; "
+        "dynamic shapes via SANA_WM_TORCH_COMPILE_DYNAMIC=1). First step "
+        "includes compile warmup. If nested-compile errors appear, set "
+        "GDN_DISABLE_COMPILE=1.",
+    )
+    p.add_argument(
         "--cache_camera_geometry",
         action="store_true",
         help="Precompute UCPE ray matrices, WanRoPE, and the Plücker embedding "
@@ -2480,6 +2492,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=11,
         help="LTX-2 refiner: maximum (sink + history + active) latent frames "
         "retained in the AR sliding window. Canonical: 11 = 1 sink + 10 recent.",
+    )
+    p.add_argument(
+        "--refiner_sigmas",
+        type=str,
+        default=None,
+        help="Comma-separated Euler sigma schedule for the refiner (descending, "
+        "ending in 0.0), e.g. '0.909375,0.725,0.421875,0.0'. Default: the "
+        "canonical 3-step distilled schedule. The refiner is step-distilled, "
+        "so off-schedule sigmas trade quality for speed.",
     )
 
     # Causal VAE + interactive chunk-pipelined streaming.
@@ -2561,6 +2582,12 @@ def main() -> None:
         config_class=InferenceConfig, config_path=resolve_hf_path(args.config), args=[]
     )
 
+    refiner_sigmas: tuple[float, ...] | None = None
+    if args.refiner_sigmas:
+        refiner_sigmas = tuple(float(s.strip()) for s in args.refiner_sigmas.split(",") if s.strip())
+        if len(refiner_sigmas) < 2 or refiner_sigmas[-1] != 0.0 or list(refiner_sigmas) != sorted(refiner_sigmas, reverse=True):
+            raise SystemExit("--refiner_sigmas must be a descending comma-separated list ending in 0.0.")
+
     refiner = (
         None
         if args.no_refiner
@@ -2571,6 +2598,7 @@ def main() -> None:
             seed=args.refiner_seed,
             block_size=args.refiner_block_size,
             kv_max_frames=args.refiner_kv_max_frames,
+            sigmas=refiner_sigmas,
         )
     )
 
@@ -2584,6 +2612,16 @@ def main() -> None:
         cache_camera_geometry=args.cache_camera_geometry,
         logger=logger,
     )
+
+    if args.compile:
+        compile_mode = os.environ.get("SANA_WM_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        compile_dynamic = os.environ.get("SANA_WM_TORCH_COMPILE_DYNAMIC", "0") == "1"
+        logger.info(f"torch.compile per DiT block: mode={compile_mode} dynamic={compile_dynamic}")
+        # Per-block keeps the model-level python (geometry prep, RoPE branches,
+        # y-mask handling) out of Dynamo; Triton GDN launches graph-break
+        # harmlessly under fullgraph=False.
+        for i, blk in enumerate(pipeline.model.blocks):
+            pipeline.model.blocks[i] = torch.compile(blk, mode=compile_mode, dynamic=compile_dynamic, fullgraph=False)
 
     denoising_step_list: list[int] | None = None
     if args.denoising_step_list:
