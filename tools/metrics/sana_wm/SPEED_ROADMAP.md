@@ -161,3 +161,9 @@ Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
 - Published 1.09x vs our 0.79x: partially unexplained; confirm with a
   961-frame run (better warmup amortization) before attributing to host
   overhead.
+- 961-frame confirmation (benchmark scene, discard): steady 0.683x — the gap
+  vs published 1.09x is REAL on this host, not warmup amortization →
+  raises K4's expected value; add a config/host diff vs upstream measurement
+  (bare-metal vs virtualized CPU, clock pinning) to the S1 checklist.
+  First-chunk hit 42.6s on the new shape: set TORCHINDUCTOR_CACHE_DIR on
+  pod 2 to persist compiles across processes/shapes.
