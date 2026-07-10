@@ -147,3 +147,17 @@ All gains are hypotheses until S0 measures them.
 Composed: ~1.5-2.5x realtime headroom on H100, no weight changes.
 Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
 1-2 months specialist, gated on the Triton prototype's result.
+
+## S0 results (2026-07-10, H100 pod, 321-frame demo, discard I/O)
+
+- Baseline: 0.66x steady-state RT writing to disk; **0.79x with output discarded**
+  → MP4 encoding sits on the critical path (~15%); local disk ≈ network volume,
+  so it is encode cost, not storage. S1 fix: async writer thread.
+- Per-stage CUDA s (serialized profile, 313 frames): **stage1 34.6 (58%) ·
+  refiner 17.1 (29%) · decode 8.1 (13%)**. Stage-1 GPU work alone (34.6s)
+  exceeds the clip's realtime budget (19.5s) → no pipelining fix can reach 1x
+  RT; stage-1 must get cheaper. Kernel priority confirmed: K4 → K1 →
+  stage1-fp8; K2 second tier.
+- Published 1.09x vs our 0.79x: partially unexplained; confirm with a
+  961-frame run (better warmup amortization) before attributing to host
+  overhead.
