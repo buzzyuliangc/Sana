@@ -88,3 +88,32 @@ revisit fidelity) and removes only step count.
   remaining levers.
 - After Phase 1: if composed speedup ≥ ~3× vs original baseline meets the
   product need, stop; Phases 2–3 only pay off for a productized pipeline.
+
+---
+
+# Streaming/causal model (SANA-WM_streaming) roadmap
+
+The streaming pipeline is an overlapped 3-stream assembly line (AR Stage-1 ∥
+chunk-causal refiner ∥ causal VAE): throughput = slowest stage, not the sum.
+Goals split into sustained realtime factor, first-chunk latency, and VRAM.
+Already shipped upstream: 4-step distilled student (CFG baked), fp8/fp4
+modes, torch.compile, KV-window refiner. Docs: ~0.93-1.09x RT on H100 bf16;
+KV window 11→2 gives 1.26x at quality cost; fp4 = Blackwell-only.
+
+**Phase S0 — profile the critical path** (existing --benchmark_json:
+per-stage CUDA s, first-chunk latency; check host-side launch gaps).
+
+**Phase S1 — no retraining**: CUDA graphs on the fixed-shape AR step
+(10-25% on small-chunk loops); balance the slowest stage only (refiner: KV
+window sweep 11→8→5 / fp8-refiner / SageAttention; stage1: widen fp8
+coverage); try 3-step --denoising_step_list on the 4-step student; fp8 KV
+cache; chunk-size latency/throughput dial; warm-server for first-frame
+latency. Gates: standard benchmark + temporal-degradation and revisit
+weighted heavier (AR fails by drifting).
+
+**Phase S2 — light training (~$3-8k)**: 2-step/1-step re-distillation
+(DMD2-style); train-in KV window 5; depth-pruned student (20→~14 blocks).
+
+**Phase S3 — bigger bets**: Blackwell fp4 (already implemented — realtime
+on consumer 32GB); multi-GPU pipeline parallelism (one stage per GPU);
+larger-patch student (shared with bidirectional Phase 3).
