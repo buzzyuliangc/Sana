@@ -51,6 +51,7 @@ from .sana_gdn_blocks import (
     BidirectionalGDN,
     ChunkCausalGDN,
     _forward_softmax_attn,
+    _sdpa_maybe_sage,
     _sdpa_needs_head_pad,
     flip_and_shift,
 )
@@ -163,7 +164,9 @@ def _sdpa_unmasked_with_pad(
         q = F.pad(q, (0, _pad_size))
         k = F.pad(k, (0, _pad_size))
         v = F.pad(v, (0, _pad_size))
-    out = F.scaled_dot_product_attention(q, k, v)
+    # Inputs are already padded to an FA-friendly head_dim here, so the
+    # helper's default (padded) softmax scale matches the SDPA behavior.
+    out = _sdpa_maybe_sage(q, k, v)
     if _need_pad:
         out = out[..., :D]
     return out

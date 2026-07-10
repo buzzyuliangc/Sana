@@ -718,6 +718,10 @@ class GenerationParams:
     # remaining low-noise steps run condition-only. 1.0 = full CFG.
     # Only honored by sampling_algo == "flow_euler_ltx".
     cfg_truncate_ratio: float = 1.0
+    # FORA-style mid-trajectory velocity reuse: run the model every Nth step
+    # inside [20%, 90%) of the schedule, reuse the prediction in between.
+    # 1 = disabled. Only honored by sampling_algo == "flow_euler_ltx".
+    step_cache_interval: int = 1
     flow_shift: float | None = None
     seed: int = 42
     negative_prompt: str = ""
@@ -1867,9 +1871,12 @@ class SanaWMPipeline:
             condition=cond, uncondition=neg, cfg_scale=cfg_scale, flow_shift=flow_shift, model_kwargs=model_kwargs
         )
         if algo == "flow_euler_ltx":
-            return LTXFlowEuler(model_fn, **base, cfg_truncate_ratio=params.cfg_truncate_ratio).sample(
-                z, steps=steps, generator=generator
-            )
+            return LTXFlowEuler(
+                model_fn,
+                **base,
+                cfg_truncate_ratio=params.cfg_truncate_ratio,
+                step_cache_interval=params.step_cache_interval,
+            ).sample(z, steps=steps, generator=generator)
         if params.cfg_truncate_ratio < 1.0:
             self.logger.warning(
                 f"cfg_truncate_ratio={params.cfg_truncate_ratio} is only honored by "
@@ -2380,6 +2387,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "steps; remaining steps are condition-only (single forward). "
         "flow_euler_ltx only.",
     )
+    p.add_argument(
+        "--step_cache_interval",
+        type=int,
+        default=1,
+        help="FORA-style caching: mid-trajectory (20-90%% of steps), run the "
+        "DiT only every Nth step and reuse the previous velocity between. "
+        "1 disables. flow_euler_ltx only.",
+    )
     p.add_argument("--flow_shift", type=float, default=None, help="Override the scheduler's inference flow_shift.")
     p.add_argument(
         "--sampling_algo",
@@ -2667,6 +2682,7 @@ def main() -> None:
         step=args.step,
         cfg_scale=args.cfg_scale,
         cfg_truncate_ratio=args.cfg_truncate_ratio,
+        step_cache_interval=args.step_cache_interval,
         flow_shift=args.flow_shift,
         seed=args.seed,
         negative_prompt=args.negative_prompt,

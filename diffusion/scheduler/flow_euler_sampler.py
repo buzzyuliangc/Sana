@@ -86,7 +86,15 @@ class FlowEuler:
 
 class LTXFlowEuler(FlowEuler):
     def __init__(
-        self, model_fn, condition, uncondition, cfg_scale, flow_shift=3.0, model_kwargs=None, cfg_truncate_ratio=1.0
+        self,
+        model_fn,
+        condition,
+        uncondition,
+        cfg_scale,
+        flow_shift=3.0,
+        model_kwargs=None,
+        cfg_truncate_ratio=1.0,
+        step_cache_interval=1,
     ):
         super().__init__(model_fn, condition, uncondition, cfg_scale, flow_shift, model_kwargs)
         if not 0.0 <= cfg_truncate_ratio <= 1.0:
@@ -95,6 +103,14 @@ class LTXFlowEuler(FlowEuler):
         # ceil(cfg_truncate_ratio * steps) steps; the remaining (low-noise)
         # steps run condition-only, halving their model-eval cost.
         self.cfg_truncate_ratio = cfg_truncate_ratio
+        if step_cache_interval < 1:
+            raise ValueError(f"step_cache_interval must be >= 1, got {step_cache_interval}")
+        # FORA-style step caching: in the mid-trajectory band (steps in
+        # [20%, 90%) of the schedule), run the model only every Nth step and
+        # reuse the previous velocity prediction in between. The scheduler
+        # still integrates every step, so this coarsens the velocity field
+        # without changing the sigma schedule. 1 = disabled.
+        self.step_cache_interval = step_cache_interval
 
     # Kwargs the pipeline CFG-duplicates to batch 2 as ``cat([uncond, cond])``.
     # Keyed explicitly so an unrelated future kwarg whose leading dim happens
@@ -185,36 +201,54 @@ class LTXFlowEuler(FlowEuler):
 
         init_latents = latents.clone()  # here we need to clone to avoid modifying the original latents
 
+        # FORA-style caching band: protect the composition-setting head and the
+        # detail-resolving tail; reuse velocities only mid-trajectory.
+        cache_lo = math.ceil(0.2 * len(timesteps))
+        cache_hi = math.floor(0.9 * len(timesteps))
+        cached_noise_pred = None
+
         for i, t in tqdm(list(enumerate(timesteps)), disable=os.getenv("DPM_TQDM", "False") == "True"):
             if image_cond_noise_scale > 0:
                 latents = self.add_noise_to_image_conditioning_latents(
                     t / 1000.0, init_latents, latents, image_cond_noise_scale, condition_mask, generator
                 )
 
-            use_cfg = do_classifier_free_guidance and i < num_cfg_steps
-            condition_mask_input = torch.cat([condition_mask] * 2) if use_cfg else condition_mask
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if use_cfg else latents
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            timestep = t.expand(condition_mask_input.shape).float()
-            timestep = torch.min(timestep, (1 - condition_mask_input) * 1000.0)
+            reuse_cached = (
+                self.step_cache_interval > 1
+                and cached_noise_pred is not None
+                and cache_lo <= i < cache_hi
+                and i % self.step_cache_interval != 0
+            )
+            if reuse_cached:
+                noise_pred = cached_noise_pred
+                timestep = t.expand(condition_mask.shape).float()
+                timestep = torch.min(timestep, (1 - condition_mask) * 1000.0)
+            else:
+                use_cfg = do_classifier_free_guidance and i < num_cfg_steps
+                condition_mask_input = torch.cat([condition_mask] * 2) if use_cfg else condition_mask
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if use_cfg else latents
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(condition_mask_input.shape).float()
+                timestep = torch.min(timestep, (1 - condition_mask_input) * 1000.0)
 
-            noise_pred = self.model(
-                latent_model_input,
-                # timestep[:, 0, 0, 0, 0], # b
-                timestep[:, :1, :, 0, 0],  # b,c,f,h,w -> b,1,f
-                prompt_embeds if use_cfg else self.condition,
-                **(self.model_kwargs if use_cfg else (model_kwargs_cond or self.model_kwargs)),
-            )  # b,c,f,h,w
+                noise_pred = self.model(
+                    latent_model_input,
+                    # timestep[:, 0, 0, 0, 0], # b
+                    timestep[:, :1, :, 0, 0],  # b,c,f,h,w -> b,1,f
+                    prompt_embeds if use_cfg else self.condition,
+                    **(self.model_kwargs if use_cfg else (model_kwargs_cond or self.model_kwargs)),
+                )  # b,c,f,h,w
 
-            if isinstance(noise_pred, Transformer2DModelOutput):
-                noise_pred = noise_pred[0]
+                if isinstance(noise_pred, Transformer2DModelOutput):
+                    noise_pred = noise_pred[0]
 
-            # perform guidance
-            if use_cfg:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_text - noise_pred_uncond)
-                timestep = timestep.chunk(2)[0]
+                # perform guidance
+                if use_cfg:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.cfg_scale * (noise_pred_text - noise_pred_uncond)
+                    timestep = timestep.chunk(2)[0]
+                cached_noise_pred = noise_pred
 
             # compute the previous noisy sample x_t -> x_t-1
             latents_dtype = latents.dtype

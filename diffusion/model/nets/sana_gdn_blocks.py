@@ -55,6 +55,42 @@ _SDPA_D112_DIRECT = os.environ.get("SANA_WM_SDPA_D112_DIRECT", "").strip().lower
 
 OUTPUT_GATE_INIT_BIAS = 1.278464542761074  # silu(x)=1.0
 
+# Optional INT8 exact-algorithm attention (SageAttention) for the softmax
+# blocks, enabled with SANA_WM_SAGE_ATTENTION=1. Same algorithm as SDPA
+# (quantized QK^T with per-block scales), so it is a speed/quality trade
+# validated by the benchmark gates rather than a behavioral switch.
+_sageattn_fn = None
+if os.environ.get("SANA_WM_SAGE_ATTENTION", "0") == "1":
+    try:
+        from sageattention import sageattn as _sageattn_fn
+    except ImportError:
+        import warnings
+
+        warnings.warn("SANA_WM_SAGE_ATTENTION=1 but sageattention is not installed; falling back to SDPA.")
+
+
+def _sdpa_maybe_sage(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask=None) -> torch.Tensor:
+    """SDPA drop-in that routes to SageAttention when enabled and applicable.
+
+    Inputs are ``(B, H, N, D)``. Unsupported cases (mask present, fp32,
+    head_dim > 128) silently use ``F.scaled_dot_product_attention``.
+    Head dims below 128 are zero-padded up (zero q/k columns add nothing to
+    logits; padded v columns are sliced away), mirroring _sdpa_needs_head_pad.
+    """
+    if _sageattn_fn is None or attn_mask is not None or q.dtype not in (torch.float16, torch.bfloat16):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    D = q.shape[-1]
+    if D > 128:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    if D not in (64, 96, 128):
+        pad = 128 - D
+        # sm_scale must reflect the ORIGINAL head_dim, not the padded one.
+        out = _sageattn_fn(
+            F.pad(q, (0, pad)), F.pad(k, (0, pad)), F.pad(v, (0, pad)), tensor_layout="HND", sm_scale=D**-0.5
+        )
+        return out[..., :D]
+    return _sageattn_fn(q, k, v, tensor_layout="HND")
+
 
 def _sdpa_needs_head_pad(head_dim: int) -> bool:
     if head_dim == 112 and _SDPA_D112_DIRECT:
@@ -806,7 +842,7 @@ def _forward_softmax_attn(
 
     attn_mask = _get_frame_causal_mask(T, S, x.device) if frame_causal else None
 
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    out = _sdpa_maybe_sage(q, k, v, attn_mask=attn_mask)
     out = out.transpose(1, 2).reshape(B, N, C).to(dtype_orig)
 
     if apply_output_gate:
