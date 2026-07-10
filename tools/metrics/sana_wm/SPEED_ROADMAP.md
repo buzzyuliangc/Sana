@@ -117,3 +117,33 @@ weighted heavier (AR fails by drifting).
 **Phase S3 — bigger bets**: Blackwell fp4 (already implemented — realtime
 on consumer 32GB); multi-GPU pipeline parallelism (one stage per GPU);
 larger-patch student (shared with bidirectional Phase 3).
+
+---
+
+# Streaming kernel plan (detail for Phase S1 items)
+
+Regime: ~2,640 tokens/chunk (3 latent frames), 4 steps x 20 blocks per chunk
+— launch-overhead + memory-bound; opposite of the bidirectional regime.
+All gains are hypotheses until S0 measures them.
+
+- **S0 profile** (2 days): torch.profiler + nsys per chunk — launch-gap share,
+  GDN/softmax/GEMM/elementwise split, refiner host-side KV-cache cost,
+  inter-stream bubbles. Decides K1-vs-K2 priority.
+- **K4 CUDA graphs** (1-2 wks, 1.1-1.25x pipeline): graph-capture the static
+  per-chunk step; prerequisite = fixed-size KV/state buffers (shared with K2).
+- **K1 fused streaming-GDN kernel** (4-8 wks, 1.3-1.8x stage-1): fuse
+  conv->gates->delta update->read->gate for the cached chunk-causal GDN
+  (state 20 heads x 112x112, tensor-core aligned). Stage order: reference
+  oracle tests -> Triton fusion prototype (off-ramp if >80% of gain) ->
+  CuTe DSL port (TMA + WGMMA warp-specialized, state SMEM-resident) ->
+  fp8-IO variant. Oracle = existing Triton kernels; same Tier-0 discipline.
+- **K2 ring-buffer window attention + fp8 KV** (2-4 wks, 1.3-1.7x refiner):
+  cheap half first (pre-allocated ring KV + copy_, no kernel — enables K4);
+  then CuTe/FA3-style kernel with in-kernel wraparound, pinned sink rows,
+  fp8 KV with per-block scales.
+- **K3 elementwise/epilogue fusions** (1-3 wks, 1.05-1.15x): adaLN modulate,
+  QK norms, GLUMBConvTemp chain; do last (earlier work changes the op mix).
+
+Composed: ~1.5-2.5x realtime headroom on H100, no weight changes.
+Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
+1-2 months specialist, gated on the Triton prototype's result.
