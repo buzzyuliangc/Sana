@@ -30,9 +30,14 @@ Usage (from the repo root, sana env):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+# Must be set before any sana/diffusion import (mirrors inference_sana_wm.py):
+# the xformers cross-attention path asserts on tensor y_lens.
+os.environ.setdefault("DISABLE_XFORMERS", "1")
 
 import numpy as np
 import torch
