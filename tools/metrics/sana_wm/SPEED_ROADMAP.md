@@ -178,3 +178,14 @@ Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
   wired for image-conditioned WM use. Euler-40 + cfg-truncation remains best.
 - fp8block (TE Float8BlockScaling): requires CUDA >= 12.9; env is cu128 →
   added fp8delayed (per-tensor DelayedScaling) and requeued (phase1d).
+- **SageAttention: REJECTED** (1.82x e2e, +6.5% marginal over stackB; VBench
+  −3.9 on matched scenes with pose unaffected; Tier-0 maxΔ 3-7 = normal
+  trajectory divergence, integration sane → genuine INT8 visual-quality cost).
+- **Step-cache interval 2 on 40-step base: REJECTED** (2.24x e2e; VBench −3.9,
+  RotErr +7.2% > gate). Gentler variants (60-step base / narrower band)
+  untested; pattern suggests mid-trajectory evals carry real information here.
+- **Per-block profile** (bug-caveated but internally consistent): GDN ~58%,
+  softmax ~36%, FFN ~6%, cross-attn ~2% of the 12.6s step → windowed-softmax
+  (Phase 2) caps near 1.5x; GDN kernels are the larger stage-1 target.
+- Standing champion remains **stack B: 1.709x, all gates passed** (confirmed
+  at 80 scenes x 2 splits; VBench 79.75/81.75 vs official ~79.55/81.10).
