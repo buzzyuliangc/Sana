@@ -394,6 +394,12 @@ def _make_stage1_nvfp4_recipe():
     import transformer_engine.common.recipe as te_recipe
 
     quant = os.environ.get("SANA_WM_STAGE1_QUANT", "nvfp4").strip().lower()
+    if quant in {"fp8delayed", "fp8tensor"}:
+        # Classic per-tensor delayed scaling: works on Hopper with CUDA 12.8
+        # (Float8BlockScaling needs CUDA >= 12.9). Coarser scaling than
+        # block-wise — the low-magnitude camera-control residual is the
+        # quality watch item; pose gates judge.
+        return te_recipe.DelayedScaling()
     if quant in {"fp8block", "fp8", "float8block"}:
         return te_recipe.Float8BlockScaling()
     # RHT (random Hadamard transform) spreads outliers so a small signal in a
