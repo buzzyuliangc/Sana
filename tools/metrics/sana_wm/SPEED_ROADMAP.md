@@ -167,3 +167,14 @@ Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
   (bare-metal vs virtualized CPU, clock pinning) to the S1 checklist.
   First-chunk hit 42.6s on the new shape: set TORCHINDUCTOR_CACHE_DIR on
   pod 2 to persist compiles across processes/shapes.
+
+## Phase 1 partial results (2026-07-12)
+
+- **DPM-solver sweep: REJECTED at all step counts** (20/25/30 → RotErr
+  21.4/11.1/3.96 deg vs 1.59 baseline; VBench −8.7/−9.0/−5.8). The
+  flow_dpm-solver path lacks LTXFlowEuler's condition-mask / per-token
+  timestep anchoring, so first-frame conditioning erodes during sampling and
+  degrades further with coarser integration. Repo finding: DPM path is not
+  wired for image-conditioned WM use. Euler-40 + cfg-truncation remains best.
+- fp8block (TE Float8BlockScaling): requires CUDA >= 12.9; env is cu128 →
+  added fp8delayed (per-tensor DelayedScaling) and requeued (phase1d).
