@@ -195,3 +195,10 @@ Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
   all pose metrics (RotErr −20%/−28%, TransErr −14%/−10%, CamMC −14%/−11%)
   with VBench −0.87/−0.14 (cross-environment). Headline: 1.71x faster AND
   measurably better camera adherence than the published configuration.
+- **fp8delayed (per-tensor W8A8): REJECTED — null result.** Conversion
+  verified active (TE swapped+wrapped layers, both narrow and wide modes),
+  yet 539/538 s vs 538 s stack B: 0% speedup. Per-tensor DelayedScaling's
+  cast/amax overhead cancels its GEMM gains at these shapes with GDN (58%)
+  in bf16. Proper fp8 verdict needs Float8BlockScaling (CUDA >= 12.9 env)
+  or fp4 on Blackwell. Phase 1 CLOSED: stack B (1.709x) is the
+  no-retraining frontier on this stack.
