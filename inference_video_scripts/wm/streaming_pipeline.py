@@ -42,7 +42,7 @@ import torch
 
 from diffusion.model.ltx2 import CausalVaeStreamingDecoder
 from diffusion.refiner.diffusers_ltx2_refiner import RefinerChunkRunner
-from inference_video_scripts.wm.streaming_mp4_writer import StreamingMp4Writer
+from inference_video_scripts.wm.streaming_mp4_writer import AsyncStreamingMp4Writer, StreamingMp4Writer
 
 
 def _env_flag(name: str) -> bool:
@@ -81,6 +81,9 @@ class StreamingPipelineConfig:
     mp4_crf: int = 18
     mp4_preset: str = "medium"
     mp4_encoder: str = "libx264"
+    # Feed ffmpeg from a bounded-queue writer thread so encode overlaps
+    # generation instead of stalling it via stdin backpressure (~15% RT).
+    mp4_async_writer: bool = True
     drop_first_pixel: bool = True
     output_mode: str = "mp4"
     profile_cuda: bool = False
@@ -305,10 +308,11 @@ def run_streaming_inference(
     pending: deque[tuple[torch.cuda.Event | None, torch.Tensor | int, int]] = deque()
     writer = None
 
-    def _get_writer() -> StreamingMp4Writer:
+    def _get_writer() -> StreamingMp4Writer | AsyncStreamingMp4Writer:
         nonlocal writer
         if writer is None:
-            writer = StreamingMp4Writer(
+            writer_cls = AsyncStreamingMp4Writer if bool(config.mp4_async_writer) else StreamingMp4Writer
+            writer = writer_cls(
                 config.output_path,
                 height=int(pixel_h),
                 width=int(pixel_w),
@@ -763,7 +767,8 @@ def _run_streaming_inference_sequential(
 
     writer = None
     if output_mode == "mp4":
-        writer = StreamingMp4Writer(
+        writer_cls = AsyncStreamingMp4Writer if bool(config.mp4_async_writer) else StreamingMp4Writer
+        writer = writer_cls(
             config.output_path,
             height=int(pixel_h),
             width=int(pixel_w),

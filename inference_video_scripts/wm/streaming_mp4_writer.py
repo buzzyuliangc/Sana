@@ -242,3 +242,87 @@ class StreamingMp4Writer:
                 self._proc.terminate()
         finally:
             pass
+
+
+class AsyncStreamingMp4Writer:
+    """Bounded-queue wrapper that takes MP4 encoding off the pipeline thread.
+
+    ``StreamingMp4Writer.write_chunk`` blocks on ffmpeg's stdin pipe: when the
+    encoder falls behind, OS pipe backpressure stalls the generation loop
+    (measured ~15% of realtime on H100). This wrapper enqueues chunks and a
+    daemon thread feeds ffmpeg, so encode overlaps generation. Ordering is
+    preserved (single queue, single consumer). If the encoder is persistently
+    slower than generation, ``write_chunk`` still blocks once the queue is
+    full — bounded memory, graceful degradation to today's behavior.
+
+    Writer-thread failures are captured and re-raised on the next
+    ``write_chunk``/``close`` call, so errors cannot pass silently.
+    """
+
+    _SENTINEL = None
+
+    def __init__(self, *args, queue_chunks: int = 4, **kwargs) -> None:
+        import queue
+        import threading
+
+        self._inner = StreamingMp4Writer(*args, **kwargs)
+        self._queue: "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=max(1, int(queue_chunks)))
+        self._error: BaseException | None = None
+        self._closed = False
+
+        def _drain() -> None:
+            while True:
+                item = self._queue.get()
+                if item is self._SENTINEL:
+                    return
+                try:
+                    self._inner.write_chunk(item)
+                except BaseException as exc:  # noqa: BLE001 — surfaced on caller thread
+                    self._error = exc
+                    return
+
+        self._thread = threading.Thread(target=_drain, name="mp4-writer", daemon=True)
+        self._thread.start()
+
+    def _raise_pending(self) -> None:
+        if self._error is not None:
+            err, self._error = self._error, None
+            raise RuntimeError("async MP4 writer thread failed") from err
+
+    @property
+    def output_path(self) -> Path:
+        return self._inner.output_path
+
+    @property
+    def frames_written(self) -> int:
+        # Counted by the inner writer as chunks actually reach ffmpeg.
+        return self._inner.frames_written
+
+    @property
+    def ffmpeg_command(self) -> str:
+        return self._inner.ffmpeg_command
+
+    def write_chunk(self, frames_uint8: np.ndarray) -> None:
+        self._raise_pending()
+        if self._closed:
+            raise RuntimeError("write_chunk called after close().")
+        self._queue.put(frames_uint8)
+
+    def close(self) -> Path:
+        if self._closed:
+            return self._inner.output_path
+        self._closed = True
+        self._queue.put(self._SENTINEL)
+        self._thread.join()
+        self._raise_pending()
+        return self._inner.close()
+
+    def __enter__(self) -> AsyncStreamingMp4Writer:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self._closed = True
+            self._inner.__exit__(exc_type, exc, tb)

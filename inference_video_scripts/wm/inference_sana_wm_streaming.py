@@ -232,6 +232,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Alias for --output_mode=discard; excludes uint8 CPU transfer and MP4 encoding from timings.",
     )
     p.add_argument(
+        "--async_writer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Feed ffmpeg from a bounded-queue writer thread so MP4 encoding "
+        "overlaps generation instead of stalling it (--no-async_writer for "
+        "the legacy synchronous writer).",
+    )
+    p.add_argument(
         "--benchmark_json", type=Path, default=None, help="Optional JSON file with wall-clock throughput metrics."
     )
     p.add_argument(
@@ -555,6 +563,7 @@ def main() -> None:
             streaming_crf=args.streaming_crf,
             streaming_preset=args.streaming_preset,
             streaming_encoder=args.streaming_encoder,
+            streaming_async_writer=args.async_writer,
             output_mode=output_mode,
             profile_cuda=args.profile_cuda,
             sample_frames_path=sample_frames_path,
