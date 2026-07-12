@@ -189,3 +189,9 @@ Resourcing: S0+K4+K2-cheap = ~3-4 wks generalist; K1-CuTe + K2-kernel =
   (Phase 2) caps near 1.5x; GDN kernels are the larger stage-1 target.
 - Standing champion remains **stack B: 1.709x, all gates passed** (confirmed
   at 80 scenes x 2 splits; VBench 79.75/81.75 vs official ~79.55/81.10).
+- **Official paper baselines found (arXiv 2605.15178 Table 2, SANA-WM+refiner)**:
+  simple RotErr 4.50 / TransErr 1.39 / CamMC 1.41 / VBench 80.62;
+  hard RotErr 8.34 / 1.39 / 1.44 / VBench 81.89. Stack B at 160 scenes BEATS
+  all pose metrics (RotErr −20%/−28%, TransErr −14%/−10%, CamMC −14%/−11%)
+  with VBench −0.87/−0.14 (cross-environment). Headline: 1.71x faster AND
+  measurably better camera adherence than the published configuration.
