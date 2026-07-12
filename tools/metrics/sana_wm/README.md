@@ -31,7 +31,7 @@ benchmark, both splits, against the paper's Table-2 baselines
 | ✅ | 40 steps (in the stack) | 1.38× | passes in combination with truncation |
 | ✅ | Camera-geometry caching (`--cache_camera_geometry`) | 1.013× | bit-exact (stage-1 latents max\|Δ\| = 0) |
 | ✅ | Async MP4 writer, streaming (`--async_writer`, default on) | ~15% expected | lossless (identical bytes to ffmpeg) |
-| ⏳ | fp8 W8A8 per-tensor (`SANA_WM_STAGE1_QUANT=fp8delayed`) | pending | pending |
+| ❌ | fp8 W8A8 per-tensor (`SANA_WM_STAGE1_QUANT=fp8delayed`) | 0% (null result) | conversion verified active; cast/amax overhead cancels GEMM gains — retest needs CUDA ≥ 12.9 (block scaling) or Blackwell (fp4) |
 | ⏸ | `--compile` (per-block torch.compile) | 1.20×/step, 1.04× e2e | serving deployments only (per-process warmup; bf16 trajectory drift) |
 | ❌ | steps 30 / 20, cfg 0.3 | 1.42–2.23× | pose gates fail (+22–44% RotErr) |
 | ❌ | Flow-DPM-Solver (any steps) | up to 2.15× | sampler lacks LTXFlowEuler's first-frame anchoring → conditioning erodes (RotErr up to 21°) |
